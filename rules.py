@@ -50,13 +50,23 @@ def validate_rules(parser, arg):
 
 
 def validate_severity(parser, arg):
-    """Check that the severity level provided is correct"""
+    """Check that the severity level provided is correct."""
 
     _VALID_SEVERITIES = {'info': 0, 'warning': 1, 'error': 2}
     if arg.strip().lower() not in _VALID_SEVERITIES:
         parser.error("Invalid severity. Options are error, warning, or info")
     else:
         return _VALID_SEVERITIES[arg.strip().lower()]
+
+
+def validate_country_codes(parser, arg):
+    """Check that the supplied 2 country code is correct."""
+    country_codes = ["us", "de"]
+    if arg.strip().lower() not in country_codes:
+        parser.error("Invalid country code. Available codes are: %s" %
+            ", ".join(country_codes))
+    else:
+        return arg.strip().lower()
 
 
 def arg_parser():
@@ -68,7 +78,7 @@ def arg_parser():
     subparsers = parser.add_subparsers(dest="cmd")
     parser_validate = subparsers.add_parser("validate")
     parser_validate.add_argument(
-        "-x", "--xsd", help="NIST Voting Program XSD file path", required=True,
+        "-x", "--xsd", help="Common Data Format XSD file path", required=True,
         metavar="xsd_file", type=lambda x: validate_file(parser, x))
     parser_validate.add_argument(
         "election_file", help="XML election file to be validated",
@@ -93,6 +103,10 @@ def arg_parser():
         "-g", help="Skip check to see if there is a new OCD ID file on Github."
         "Defaults to True",
         action="store_true", required=False)
+    parser_validate.add_argument(
+        "-c", help="Two letter country code for OCD IDs.", metavar="country",
+        type=lambda x: validate_country_codes(parser, x), required=False, 
+        default="us")
     subparsers.add_parser("list")
     return parser
 
@@ -302,26 +316,28 @@ class ElectoralDistrictOcdId(base.BaseRule):
     CACHE_DIR = "~/.cache"
     GITHUB_REPO = "opencivicdata/ocd-division-ids"
     GITHUB_DIR = "identifiers"
-    GITHUB_FILE = "country-us.csv"
-    _OCDID_URL = "https://raw.github.com/{0}/master/{1}/{2}".format(
-        GITHUB_REPO, GITHUB_DIR, GITHUB_FILE)
     check_github = True
     github_repo = None
+    github_file = None
+    country_code = None
 
     def __init__(self, election_tree, schema_file, default_namespace):
         super(ElectoralDistrictOcdId, self).__init__(election_tree, schema_file, default_namespace)
-        g = Github()
-        self.github_repo = g.get_repo(self.GITHUB_REPO)
-        self.ocds = self._get_ocd_data()
         self.gpunits = []
         for gpunit in self.get_elements_by_class(self.election_tree, "GpUnit"):
             self.gpunits.append(gpunit)
+
+    def setup(self):
+        g = Github()
+        self.github_file = "country-%s.csv" % self.country_code
+        self.github_repo = g.get_repo(self.GITHUB_REPO)
+        self.ocds = self._get_ocd_data()
 
     def _get_latest_commit_date(self):
         """Returns the latest commit date to country-us.csv."""
         latest_commit_date = None
         latest_commit = self.github_repo.get_commits(
-            path="{0}/{1}".format(self.GITHUB_DIR, self.GITHUB_FILE))[0]
+            path="{0}/{1}".format(self.GITHUB_DIR, self.github_file))[0]
         latest_commit_date = latest_commit.commit.committer.date
         return latest_commit_date
 
@@ -330,14 +346,16 @@ class ElectoralDistrictOcdId(base.BaseRule):
         blob_sha = None
         dir_contents = self.github_repo.get_dir_contents(self.GITHUB_DIR)
         for content_file in dir_contents:
-            if content_file.name == self.GITHUB_FILE:
+            if content_file.name == self.github_file:
                 blob_sha = content_file.sha
                 break
         return blob_sha
 
     def _download_data(self, file_path):
         """Makes a request to Github to download the file."""
-        r = requests.get(self._OCDID_URL)
+        ocdid_url = "https://raw.github.com/{0}/master/{1}/{2}".format(
+            self.GITHUB_REPO, self.GITHUB_DIR, self.github_file)
+        r = requests.get(ocdid_url)
         with io.open("{0}.tmp".format(file_path), "wb") as fd:
             for chunk in r.iter_content():
                 fd.write(chunk)
@@ -345,7 +363,7 @@ class ElectoralDistrictOcdId(base.BaseRule):
         if not valid:
             raise base.ElectionError(
                 "Could not successfully download OCD ID data files. "
-                "Please try downloading the file country-us.csv manually and "
+                "Please try downloading the file manually and "
                 "place it in ~/.cache")
         else:
             copyfile("{0}.tmp".format(file_path), file_path)
@@ -374,8 +392,7 @@ class ElectoralDistrictOcdId(base.BaseRule):
     def _get_ocd_data(self):
         """Checks if OCD file is in ~/cache, downloads it if not."""
         cache_directory = os.path.expanduser(self.CACHE_DIR)
-        countries_file = "{0}/{1}".format(cache_directory, self.GITHUB_FILE)
-
+        countries_file = "{0}/{1}".format(cache_directory, self.github_file)
         if not os.path.exists(countries_file):
             if not os.path.exists(cache_directory):
                 os.makedirs(cache_directory)
@@ -616,7 +633,7 @@ class OtherType(base.BaseRule):
 class PartisanPrimary(base.BaseRule):
     """Partisan elections should link to the correct political party.
 
-    For a NIST Election element of Election type primary, partisan-primary-open,
+    For an Election element of Election type primary, partisan-primary-open,
     or partisan-primary-closed, the Contests in that ContestCollection should
     have a PrimartyPartyIds that is present and non-empty.
     """
@@ -677,7 +694,19 @@ class PartisanPrimaryHeuristic(PartisanPrimary):
                         "but is not marked up as such." % (
                             element.sourceline, contest_name.text))
 
+class CoalitionParties(base.TreeRule):
+    """Coaltions should always define the Party IDs."""
 
+    def check(self):
+        coalitions = self.get_elements_by_class(self.election_tree, "Coalition")
+        for coalition in coalitions:
+            party_id = coalition.find("PartyIds")
+            if (party_id is None or not party_id.text or
+                not party_id.text.strip()):
+                raise base.ElectionError(
+                    "Line %d. Coalition %s must define PartyIDs" %
+                    (coalition.sourceline, coalition.get("objectId", None)))
+                    
 class UniqueLabel(base.BaseRule):
     """Labels should be unique within a file.
     """
@@ -754,7 +783,8 @@ _RULES = [
     UniqueLabel,
     PartisanPrimary,
     PartisanPrimaryHeuristic,
-    ReusedCandidate
+    ReusedCandidate,
+    CoalitionParties
 ]
 
 
@@ -781,6 +811,11 @@ def main():
                 base.RuleOption("check_github", False))
             rule_options.setdefault("GpUnitOcdId", []).append(
                 base.RuleOption("check_github", False))
+        if options.c:
+            rule_options.setdefault("ElectoralDistrictOcdId", []).append(
+                base.RuleOption("country_code", options.c))
+            rule_options.setdefault("GpUnitOcdId", []).append(
+                base.RuleOption("country_code", options.c))
         rule_classes_to_check = [x for x in _RULES
                                  if x.__name__ in rules_to_check]
         registry = base.RulesRegistry(
